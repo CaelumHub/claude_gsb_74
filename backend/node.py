@@ -55,6 +55,10 @@ class Node:
         self._register_configured_peers()
         self.log("info", f"node {self.node_id} started on port {self.port}, "
                          f"height {self.blockchain.height}")
+        for err in self.blockchain.load_errors:
+            self.log("error", f"chain load: 高度 {err['height']}: {err['reason']}"
+                              if err.get("height") is not None
+                              else f"chain load: {err['reason']}")
         if self.cfg.get("mine"):
             self.start_mining()
 

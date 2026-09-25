@@ -296,6 +296,7 @@ def create_app(node):
         blocks = bc.chain_summary()
         return _json({"height": bc.height, "chainwork": bc.chainwork,
                       "genesis_difficulty": bc.genesis_difficulty,
+                      "quarantined": bc.quarantine_public_summary(),
                       "blocks": blocks})
 
     @app.get("/api/blocks")
@@ -323,6 +324,17 @@ def create_app(node):
         else:
             block = bc.get_block_by_hash(identifier)
         if not block:
+            if identifier.isdigit():
+                batch = bc.quarantined_height(int(identifier))
+                if batch:
+                    return _json({
+                        "ok": False,
+                        "error": f"区块 #{identifier} 已被隔离"
+                                 f"（批次 {batch['id']}），"
+                                 f"可在管理后台撤销恢复",
+                        "quarantined": True,
+                        "batch": batch,
+                    }, 404)
             return _json({"ok": False, "error": "block not found"}, 404)
         return _json({"ok": True, "block": block.to_dict()})
 
@@ -581,7 +593,71 @@ def create_app(node):
 
     @app.post("/api/admin/validate")
     def admin_validate():
-        return _json(node.blockchain.validate_full_chain())
+        return _json(node.blockchain.validate_chain_detailed())
+
+    # ------------------------------------------------------------------ #
+    # Quarantine: isolate damaged blocks (reversible)
+    # ------------------------------------------------------------------ #
+    @app.get("/api/admin/quarantine")
+    def admin_quarantine_list():
+        return _json({
+            "batches": node.blockchain.quarantine_records(public=True),
+            "active": node.blockchain.quarantine_public_summary(),
+        })
+
+    @app.post("/api/admin/quarantine")
+    def admin_quarantine():
+        data = request.get_json(force=True, silent=True) or {}
+        try:
+            height = int(data.get("height"))
+        except (TypeError, ValueError):
+            return _json({"ok": False, "error": "invalid height"}, 400)
+        # The UI asks for confirmation first; require it server-side too.
+        if not data.get("confirm"):
+            return _json({"ok": False,
+                          "error": "需要确认（confirm=true）才能执行隔离"}, 400)
+        reason = str(data.get("reason", ""))[:500]
+        issues = data.get("issues")
+        if not isinstance(issues, list):
+            issues = []
+        ok, msg, batch = node.blockchain.quarantine(height, reason, issues)
+        if not ok:
+            return _json({"ok": False, "error": msg}, 400)
+        # Re-admit transactions harvested from the isolated blocks.
+        for tx_dict in batch.get("txs", []):
+            try:
+                node.txpool.re_admit([Transaction.from_dict(tx_dict)])
+            except Exception:  # noqa: BLE001 - skip unparseable tx
+                pass
+        node.save_txpool()
+        node.sync_contract_files()
+        node.log("warn", f"quarantined blocks from height {height}: {msg}")
+        batch = dict(batch)
+        batch.pop("txs", None)      # internal detail, not for the UI
+        return _json({"ok": True, "message": msg, "batch": batch,
+                      "height": node.blockchain.height})
+
+    @app.post("/api/admin/quarantine/restore")
+    def admin_quarantine_restore():
+        data = request.get_json(force=True, silent=True) or {}
+        batch_id = str(data.get("id", ""))
+        if not batch_id:
+            return _json({"ok": False, "error": "missing batch id"}, 400)
+        ok, msg = node.blockchain.restore_quarantine(batch_id)
+        if not ok:
+            return _json({"ok": False, "error": msg}, 400)
+        # Transactions of restored blocks are back on-chain: drop them from
+        # the pool so they are not mined twice.
+        for blk in node.blockchain.chain:
+            for tx in blk.transactions:
+                if not tx.is_coinbase() and node.txpool.contains(tx.txid):
+                    node.txpool.remove(tx.txid)
+        node.save_txpool()
+        node.sync_contract_files()
+        node.log("info", f"quarantine batch restored: {batch_id} "
+                         f"(height {node.blockchain.height})")
+        return _json({"ok": True, "message": msg,
+                      "height": node.blockchain.height})
 
     @app.get("/api/admin/logs")
     def admin_logs():

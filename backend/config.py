@@ -41,6 +41,8 @@ WALLETS_FILE = "wallets.json"
 VERSIONS_FILE = "versions.json"
 LOGS_FILE = "logs.json"
 CONTRACTS_SUBDIR = "contracts"
+QUARANTINE_SUBDIR = "quarantine"      # per-batch dirs with moved block/state files
+QUARANTINE_FILE = "quarantine.json"   # batch index (what was isolated, when, why)
 
 # ---------------------------------------------------------------------------
 # Smart-contract sandbox limits

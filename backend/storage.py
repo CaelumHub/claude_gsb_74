@@ -133,6 +133,9 @@ class DataPaths:
         self.wallets_path = os.path.join(root, _cfg.WALLETS_FILE)
         self.versions_path = os.path.join(root, _cfg.VERSIONS_FILE)
         self.logs_path = os.path.join(root, _cfg.LOGS_FILE)
+        self.quarantine_dir = os.path.join(root, _cfg.QUARANTINE_SUBDIR)
+        self.quarantine_index_path = os.path.join(
+            self.quarantine_dir, _cfg.QUARANTINE_FILE)
 
     def block_path(self, height):
         return os.path.join(self.blocks_dir, "%06d.json" % height)

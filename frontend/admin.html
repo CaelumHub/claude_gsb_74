@@ -5,6 +5,12 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>管理后台 · LightChain</title>
 <link rel="stylesheet" href="/static/css/style.css">
+<style>
+  .issue-list { margin: 4px 0 0; padding-left: 18px; }
+  .issue-list li { color: var(--red); font-size: 12px; margin: 2px 0; }
+  tr.row-corrupt td { background: rgba(248,113,113,.06); }
+  tr.row-quarantined td { background: rgba(251,191,36,.05); }
+</style>
 </head>
 <body>
 <div class="layout">
@@ -14,21 +20,26 @@
     <main class="content">
       <div class="page-head">
         <h1>管理后台</h1>
-        <p>链完整性校验、版本回滚、重置、分叉状态与节点日志。</p>
+        <p>逐块校验定位损坏区块、隔离与撤销恢复、版本回滚、重置与节点日志。</p>
       </div>
 
       <div class="grid cols-4">
         <div class="card stat accent"><div class="label">区块高度</div><div class="value" id="height">—</div></div>
         <div class="card stat green"><div class="label">累计工作量</div><div class="value small" id="chainwork">—</div></div>
         <div class="card stat amber"><div class="label">分叉分支</div><div class="value" id="forkBranches">—</div></div>
-        <div class="card stat purple"><div class="label">版本记录</div><div class="value" id="versionCount">—</div></div>
+        <div class="card stat red"><div class="label">隔离批次</div><div class="value" id="quarantineCount">—</div></div>
       </div>
 
       <div class="grid" style="grid-template-columns: 1fr 1fr; margin-top:16px;">
         <div class="card">
-          <h2>链完整性校验（防篡改）</h2>
-          <p class="hint" style="margin:6px 0;">逐块重算哈希、校验链接、签名、难度与状态根，检测区块/状态文件是否被篡改。</p>
-          <button class="btn primary" onclick="runValidate()">🔒 执行全链校验</button>
+          <h2>链完整性校验（逐块定位）</h2>
+          <p class="hint" style="margin:6px 0;">逐块重算哈希、校验链接、签名、难度与状态根，精确定位每个损坏块的具体问题；损坏块可隔离（可撤销），不影响其余区块。</p>
+          <div class="flex">
+            <button class="btn primary" onclick="runValidate()">🔒 执行全链逐块校验</button>
+            <label class="hint" style="display:none;align-items:center;gap:4px;" id="showAllWrap">
+              <input type="checkbox" id="showAllBlocks" onchange="renderValidateReport()"> 显示全部区块
+            </label>
+          </div>
           <div id="validateResult" style="margin-top:12px;"></div>
         </div>
 
@@ -41,6 +52,16 @@
           </div>
           <div id="dangerResult" style="margin-top:12px;"></div>
         </div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="flex">
+          <h2 style="margin:0;">隔离记录（损坏区块隔离区）</h2>
+          <div class="spacer"></div>
+          <button class="btn ghost sm" onclick="loadQuarantine()">刷新</button>
+        </div>
+        <p class="hint" style="margin:6px 0;">隔离会把损坏块及其后的区块移出主链并存入隔离区备份，链从隔离点前继续出块；撤销隔离会把备份区块原样移回。</p>
+        <div id="quarantineTable" class="table-wrap" style="margin-top:12px;"></div>
       </div>
 
       <div class="card" style="margin-top:16px;">
@@ -70,10 +91,12 @@
 <script>
 window.PAGE = "admin";
 let versions = [];
+let lastReport = null;
 
 async function init() {
   await loadStatus();
   await loadVersions();
+  await loadQuarantine();
   await loadLogs();
   pollStatus(8000);
 }
@@ -85,13 +108,11 @@ async function loadStatus() {
   $("#chainwork").textContent = (s.chainwork || 0).toLocaleString();
   const forkHeights = Object.keys(a.fork_store || {}).length;
   $("#forkBranches").textContent = forkHeights;
-  $("#versionCount").textContent = a.status.accounts + " 账户 / " + a.status.contracts + " 合约";
 }
 
 async function loadVersions() {
   const d = await API.get("/api/admin/versions");
   versions = d.versions;
-  $("#versionCount").textContent = versions.length;
   const sel = $("#rollbackHeight");
   const heights = [...new Set(versions.map(v => v.height))].sort((a, b) => a - b);
   sel.innerHTML = heights.map(h => `<option value="${h}">高度 #${h}</option>`).join("");
@@ -109,19 +130,142 @@ async function loadVersions() {
       </tr>`).join("")}</tbody></table>`;
 }
 
+/* ---------------- 逐块校验报告 ---------------- */
+
 async function runValidate() {
   $("#validateResult").innerHTML = `<span class="muted">校验中…</span>`;
-  const r = await API.get("/api/admin/validate");
-  if (r.valid) {
-    $("#validateResult").innerHTML = `
-      <div class="flex"><span class="badge green">✓ 链完整，无篡改</span>
-        <span class="muted small">已校验 ${r.checked} 个区块</span></div>`;
-  } else {
-    $("#validateResult").innerHTML = `
-      <div><span class="badge red">✗ 发现 ${r.errors.length} 处异常</span></div>
-      <ul style="margin:10px 0 0 20px;">${r.errors.map(e => `<li class="small mono" style="color:var(--red);margin:3px 0;">${esc(e)}</li>`).join("")}</ul>`;
-  }
+  const r = await API.post("/api/admin/validate");
+  lastReport = r;
+  $("#showAllWrap").style.display = "inline-flex";
+  renderValidateReport();
 }
+
+function statusBadge(status) {
+  if (status === "ok") return `<span class="badge green">✓ 正常</span>`;
+  if (status === "quarantined") return `<span class="badge amber">🚫 已隔离</span>`;
+  return `<span class="badge red">✗ 损坏</span>`;
+}
+
+function renderValidateReport() {
+  const r = lastReport;
+  if (!r) return;
+  const showAll = $("#showAllBlocks").checked;
+  let html = "";
+
+  // 汇总行
+  if (r.valid) {
+    html += `<div class="flex"><span class="badge green">✓ 链完整，无篡改</span>
+      <span class="muted small">已校验 ${r.checked} 个区块</span></div>`;
+  } else {
+    html += `<div class="flex"><span class="badge red">✗ 发现 ${r.corrupt.length} 个损坏块</span>
+      <span class="muted small">高度：${r.corrupt.map(h => "#" + h).join("、")}（共校验 ${r.checked} 个）</span></div>`;
+  }
+
+  // 启动加载时容忍的损坏（链被截断的提示）
+  if (r.load_errors && r.load_errors.length) {
+    html += `<div style="margin-top:8px;">${r.load_errors.map(e => `
+      <div class="badge amber" style="margin:2px 4px 2px 0;">⚠ ${esc(e.height != null ? "高度 " + e.height + "：" : "")}${esc(e.reason)}</div>`).join("")}</div>`;
+  }
+
+  // 逐块表格：默认只显示问题块，勾选后显示全部
+  const rows = r.blocks.filter(b => showAll || b.status !== "ok");
+  if (!rows.length) {
+    html += `<div class="empty" style="margin-top:10px;">没有需要关注的区块</div>`;
+  } else {
+    html += `<div class="table-wrap" style="margin-top:10px; max-height:420px; overflow:auto;"><table><thead><tr>
+      <th>高度</th><th>哈希</th><th>状态</th><th>具体问题</th><th>操作</th></tr></thead>
+      <tbody>${rows.map(b => `
+        <tr class="${b.status === 'corrupt' ? 'row-corrupt' : b.status === 'quarantined' ? 'row-quarantined' : ''}">
+          <td class="mono-num" style="color:var(--accent-2);">${b.height === 0 ? '创世' : '#' + b.height}</td>
+          <td class="hash">${b.hash ? fmt.hash(b.hash, 8) : "—"}</td>
+          <td>${statusBadge(b.status)}${b.on_chain ? '' : '<div class="muted small">不在主链</div>'}</td>
+          <td>${b.issues.length ? `<ul class="issue-list">${b.issues.map(i => `<li>${esc(i.message)}</li>`).join("")}</ul>` : '<span class="muted small">—</span>'}</td>
+          <td>${b.status === 'corrupt'
+              ? `<button class="btn danger sm" onclick="quarantineBlock(${b.height})">🚫 隔离此块</button>`
+              : b.status === 'quarantined'
+                ? `<span class="muted small">见隔离记录</span>`
+                : ''}</td>
+        </tr>`).join("")}</tbody></table></div>`;
+  }
+  $("#validateResult").innerHTML = html;
+}
+
+/* ---------------- 隔离 / 撤销 ---------------- */
+
+async function quarantineBlock(height) {
+  const r = lastReport;
+  const blk = r && r.blocks.find(b => b.height === height);
+  const issues = blk ? blk.issues.map(i => "· " + i.message).join("\n") : "";
+  const head = r ? r.height : "?";
+  if (!confirm(
+    `确定隔离高度 #${height} 的损坏块？\n\n` +
+    `检测到的问题：\n${issues}\n\n` +
+    `隔离后：\n` +
+    `· 高度 #${height}–#${head} 的区块将移出主链并存入隔离区备份\n` +
+    `· 链回退到高度 #${height - 1}，从该处继续出块，其余区块不受影响\n` +
+    `· 被移出区块中的交易会重新回到交易池等待打包\n` +
+    `· 该操作可在“隔离记录”中撤销恢复`)) return;
+  const d = await API.post("/api/admin/quarantine", {
+    height, confirm: true,
+    reason: blk ? blk.issues.map(i => i.message).join("；") : "",
+    issues: blk ? blk.issues : [],
+  });
+  if (d.ok) {
+    toast(d.message, "ok", 4500);
+  } else {
+    toast(d.error || "隔离失败", "err");
+  }
+  await refreshAll();
+}
+
+async function loadQuarantine() {
+  const d = await API.get("/api/admin/quarantine");
+  const batches = (d.batches || []).slice().reverse();
+  const active = batches.filter(b => !b.restored).length;
+  $("#quarantineCount").textContent = active;
+  if (!batches.length) {
+    $("#quarantineTable").innerHTML = `<div class="empty">暂无隔离记录</div>`;
+    return;
+  }
+  $("#quarantineTable").innerHTML = `<table><thead><tr>
+    <th>批次</th><th>隔离高度</th><th>原因</th><th>隔离时间</th><th>状态</th><th>操作</th></tr></thead>
+    <tbody>${batches.map(b => `
+      <tr class="${b.restored ? '' : 'row-quarantined'}">
+        <td class="mono small">${esc(b.id)}</td>
+        <td class="mono-num">#${b.from_height} – #${b.to_height}（${(b.heights || []).length} 块）</td>
+        <td class="small" style="max-width:260px;">${esc(b.reason || "—")}</td>
+        <td class="muted small">${fmt.time(b.time)}</td>
+        <td>${b.restored
+            ? `<span class="badge gray">已恢复</span><div class="muted small">${fmt.time(b.restored_at)}</div>`
+            : `<span class="badge amber">隔离中</span>`}</td>
+        <td>${b.restored ? "" : `<button class="btn amber sm" onclick="restoreQuarantine('${esc(b.id)}')">↩️ 撤销隔离</button>`}</td>
+      </tr>`).join("")}</tbody></table>`;
+}
+
+async function restoreQuarantine(id) {
+  if (!confirm(
+    `确定撤销隔离批次 ${id}？\n\n` +
+    `· 隔离区中的区块文件将原样移回链上（包括仍损坏的块）\n` +
+    `· 链将重新加载到隔离前状态\n` +
+    `· 若损坏块仍未修复，撤销后校验报告会再次标出，可重新隔离`)) return;
+  const d = await API.post("/api/admin/quarantine/restore", { id });
+  if (d.ok) {
+    toast(d.message, "ok", 4500);
+  } else {
+    toast(d.error || "撤销失败", "err", 5000);
+  }
+  await refreshAll();
+}
+
+async function refreshAll() {
+  await loadStatus();
+  await loadVersions();
+  await loadQuarantine();
+  renderTopbar();
+  if (lastReport) await runValidate();
+}
+
+/* ---------------- 危险操作 ---------------- */
 
 async function doRollback() {
   const height = parseInt($("#rollbackHeight").value);
@@ -131,7 +275,7 @@ async function doRollback() {
   $("#dangerResult").innerHTML = d.ok
     ? `<span class="badge green">✓ ${esc(d.message)}</span>`
     : `<span class="badge red">✗ ${esc(d.error)}</span>`;
-  await loadStatus(); await loadVersions(); renderTopbar();
+  await refreshAll();
 }
 
 async function doReset() {
@@ -140,7 +284,7 @@ async function doReset() {
   $("#dangerResult").innerHTML = d.ok
     ? `<span class="badge green">✓ 已重置，当前高度 #${d.height}</span>`
     : `<span class="badge red">✗ 重置失败</span>`;
-  await loadStatus(); await loadVersions(); renderTopbar();
+  await refreshAll();
 }
 
 async function loadLogs() {

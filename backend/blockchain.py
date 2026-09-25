@@ -13,7 +13,9 @@ atomically and mirrored by a version ledger for rollback.
 """
 
 import os
+import shutil
 import time
+import uuid
 
 from . import crypto, pow as pow_mod
 from .block import Block, make_genesis_block
@@ -26,6 +28,23 @@ from .transaction import Transaction, TX_COINBASE
 
 class ChainValidationError(Exception):
     pass
+
+
+class _DiskChainView:
+    """Minimal chain-like view over a list of blocks read from disk.
+
+    Used by the per-block validation report to evaluate the difficulty
+    schedule for blocks that may not be part of the loaded main chain.
+    """
+
+    def __init__(self, blocks, genesis_difficulty):
+        self._blocks = blocks           # contiguous prefix, index == height
+        self.genesis_difficulty = genesis_difficulty
+
+    def get_block(self, height):
+        if 0 <= height < len(self._blocks):
+            return self._blocks[height]
+        return None
 
 
 class Blockchain:
@@ -41,6 +60,7 @@ class Blockchain:
         self.versions = VersionLedger(paths.versions_path)
         self.last_abandoned = []
         self.last_receipts = []
+        self.load_errors = []           # problems tolerated during load()
         self._loaded = False
 
     # ==================================================================== #
@@ -92,7 +112,13 @@ class Blockchain:
         return genesis
 
     def load(self):
-        """Load the chain from disk (or create genesis if absent)."""
+        """Load the chain from disk (or create genesis if absent).
+
+        Tolerant of individual corrupted block files: instead of aborting the
+        whole node, the main chain is truncated just before the first broken
+        height and the problem is recorded in ``self.load_errors`` so the
+        operator can locate, quarantine, or restore the affected blocks.
+        """
         meta = read_json(self.paths.meta_path)
         if not meta or not os.path.exists(self.paths.block_path(0)):
             self.create_genesis()
@@ -102,22 +128,60 @@ class Blockchain:
         self.genesis_difficulty = float(meta.get("genesis_difficulty",
                                                  self.genesis_difficulty))
         blocks = []
+        self.load_errors = []
         for h in range(0, height + 1):
             data = read_json(self.paths.block_path(h))
             if data is None:
-                raise ChainValidationError(f"missing block file for height {h}")
-            blocks.append(Block.from_dict(data))
-        # Recompute hashes defensively and verify linkage.
-        for i, b in enumerate(blocks):
-            b.recompute_hash()
-            if i > 0 and b.prev_hash != blocks[i - 1].hash:
-                raise ChainValidationError(
-                    f"chain linkage broken at height {i}")
+                self.load_errors.append({
+                    "height": h,
+                    "reason": "区块文件缺失或无法解析（JSON 损坏）",
+                })
+                break
+            try:
+                blk = Block.from_dict(data)
+            except Exception as e:  # noqa: BLE001 - corrupt file structure
+                self.load_errors.append({
+                    "height": h,
+                    "reason": f"区块文件结构损坏：{e}",
+                })
+                break
+            blk.recompute_hash()
+            if blocks and blk.prev_hash != blocks[-1].hash:
+                self.load_errors.append({
+                    "height": h,
+                    "reason": "与前序区块的哈希链接断裂",
+                })
+                break
+            blocks.append(blk)
+        if not blocks:
+            # The genesis block itself is unreadable — nothing safe to
+            # truncate to; this needs manual intervention (reset or resync).
+            raise ChainValidationError("genesis block missing or unreadable")
+        if self.load_errors:
+            broken = self.load_errors[0]
+            self.load_errors.append({
+                "height": None,
+                "reason": f"主链已截断到高度 {blocks[-1].index}；高度 "
+                          f"{broken['height']} 及之后的区块未加载，可通过"
+                          f"管理后台的逐块校验定位并隔离",
+            })
         self.chain = blocks
-        state_data = read_json(self.paths.state_path(height))
-        self.state = WorldState.from_dict(state_data) if state_data else WorldState()
+        self.state, _ = self._load_state_snapshot(blocks[-1].index)
         self.chainwork = self.cumulative_work_of(blocks)
         self._loaded = True
+
+    def _load_state_snapshot(self, height):
+        """Return ``(state, actual_height)`` from the newest readable snapshot
+        at or below ``height`` (falls back to an empty state)."""
+        for h in range(height, -1, -1):
+            data = read_json(self.paths.state_path(h))
+            if data is None:
+                continue
+            try:
+                return WorldState.from_dict(data), h
+            except Exception:  # noqa: BLE001 - try an older snapshot
+                continue
+        return WorldState(), -1
 
     def _write_meta(self):
         meta = {
@@ -401,6 +465,11 @@ class Blockchain:
         self._delete_block_files_above(target_height)
         self._write_meta()
         self.versions.record(target_height, self.head.hash)
+        # Load-time problems above the rollback point are now resolved.
+        self.load_errors = [
+            e for e in self.load_errors
+            if e.get("height") is not None and e["height"] <= target_height
+        ]
         return True, f"rolled back to height {target_height}"
 
     # ==================================================================== #
@@ -467,48 +536,427 @@ class Blockchain:
         return txs[:limit]
 
     # ==================================================================== #
-    # Tamper detection / full validation
+    # Tamper detection: per-block validation report
     # ==================================================================== #
-    def validate_full_chain(self):
-        """Re-verify every block and the stored state; report tampering."""
-        report = {"valid": True, "checked": 0, "errors": []}
-        if not self.chain:
-            report["errors"].append("empty chain")
-            report["valid"] = False
-            return report
+    # Chinese descriptions for the structural failure reasons produced by
+    # Block.validate_structure(), so the per-block report can pinpoint what
+    # exactly is wrong with each damaged block.
+    _REASON_ZH = {
+        "missing block hash": "缺少区块哈希",
+        "block hash does not match header contents":
+            "区块哈希与头部内容不符（文件内容可能被篡改）",
+        "proof-of-work does not satisfy difficulty": "工作量证明不满足难度要求",
+        "merkle root mismatch": "Merkle 根与交易列表不符（交易可能被篡改）",
+        "multiple coinbase transactions": "包含多个 coinbase 交易",
+        "coinbase must be the first transaction": "coinbase 交易必须是第一笔交易",
+    }
 
-        prev = None
-        for blk in self.chain:
+    def _disk_block_heights(self):
+        """Sorted heights of all block files present on disk."""
+        heights = []
+        if os.path.isdir(self.paths.blocks_dir):
+            for f in os.listdir(self.paths.blocks_dir):
+                name, _, ext = f.partition(".")
+                if ext == "json" and name.isdigit():
+                    heights.append(int(name))
+        return sorted(heights)
+
+    def _quarantine_gap(self):
+        """Height range of the active quarantine gap, or ``None``.
+
+        A gap exists while an un-restored quarantine batch starts above the
+        current chain head (the isolated files were moved away and no new
+        blocks have been mined over the gap yet).
+        """
+        for b in self.quarantine_records():
+            if not b.get("restored") and b["from_height"] > self.height:
+                return b
+        return None
+
+    def validate_chain_detailed(self):
+        """Verify every block file individually and build a per-block report.
+
+        Each entry describes one height with ``status`` (``ok`` / ``corrupt``
+        / ``quarantined``) and a list of human-readable ``issues`` explaining
+        exactly what is wrong, so a single damaged block file can be located
+        precisely instead of failing the whole chain check.
+        """
+        disk_heights = self._disk_block_heights()
+        gap = self._quarantine_gap()
+        max_h = max([self.height, gap["to_height"] if gap else -1]
+                    + disk_heights + [-1])
+
+        report = {
+            "valid": True,
+            "checked": 0,
+            "height": self.height,
+            "disk_blocks": len(disk_heights),
+            "corrupt": [],
+            "blocks": [],
+            "quarantined": self.quarantine_records(public=True),
+            "load_errors": list(self.load_errors),
+            "errors": [],
+        }
+
+        prev_block = None         # last readable block (for linkage checks)
+        prev_broken = False       # previous height could not be verified
+        view_blocks = []          # contiguous readable prefix, for difficulty
+        view_valid = True         # False once the prefix has a gap
+        for h in range(0, max_h + 1):
+            entry = {"height": h, "hash": None, "status": "ok",
+                     "on_chain": h <= self.height, "issues": []}
             report["checked"] += 1
-            blk.recompute_hash()
-            if prev is not None:
-                if blk.prev_hash != prev.hash:
-                    report["errors"].append(
-                        f"height {blk.index}: prev_hash mismatch")
-                ok, reason = self.validate_block(blk, prev)
-                if not ok:
-                    report["errors"].append(
-                        f"height {blk.index}: {reason}")
-            # Compare stored state snapshot to the block's committed root.
-            snap = read_json(self.paths.state_path(blk.index))
-            if snap is None:
-                report["errors"].append(
-                    f"height {blk.index}: missing state snapshot")
+
+            # An active quarantine gap: files were moved aside on purpose.
+            if gap and gap["from_height"] <= h <= gap["to_height"]:
+                entry["status"] = "quarantined"
+                entry["on_chain"] = False
+                entry["issues"].append({
+                    "code": "quarantined",
+                    "message": f"该区块已被隔离（批次 {gap['id']}），"
+                               f"可在管理后台撤销恢复",
+                })
+                report["blocks"].append(entry)
+                prev_block = None
+                prev_broken = True
+                view_valid = False
+                continue
+
+            raw = read_json(self.paths.block_path(h))
+            if raw is None:
+                entry["status"] = "corrupt"
+                entry["issues"].append({
+                    "code": "file_unreadable",
+                    "message": "区块文件缺失或 JSON 无法解析",
+                })
+                report["blocks"].append(entry)
+                prev_block = None
+                prev_broken = True
+                view_valid = False
+                continue
+
+            try:
+                blk = Block.from_dict(raw)
+            except Exception as e:  # noqa: BLE001 - corrupt structure
+                entry["status"] = "corrupt"
+                entry["issues"].append({
+                    "code": "parse_error",
+                    "message": f"区块文件结构损坏：{e}",
+                })
+                report["blocks"].append(entry)
+                prev_block = None
+                prev_broken = True
+                view_valid = False
+                continue
+
+            entry["hash"] = blk.hash
+
+            # 1. Linkage with the previous readable block.
+            if h > 0:
+                if prev_block is not None and blk.prev_hash != prev_block.hash:
+                    entry["issues"].append({
+                        "code": "linkage",
+                        "message": "prev_hash 与前序区块不符（哈希链接断裂）",
+                    })
+                elif prev_broken:
+                    entry["issues"].append({
+                        "code": "linkage_unknown",
+                        "message": "前序区块损坏，哈希链接无法验证",
+                    })
+
+            # 2. Structure (hash recompute, PoW, merkle root, coinbase rules).
+            #    Genesis is exempt from PoW, so only its hash is re-checked.
+            if h == 0:
+                stored = blk.hash
+                if blk.recompute_hash() != stored:
+                    entry["issues"].append({
+                        "code": "hash_mismatch",
+                        "message": self._REASON_ZH[
+                            "block hash does not match header contents"],
+                    })
             else:
-                stored_state = WorldState.from_dict(snap)
-                if stored_state.root() != blk.header.state_root:
-                    report["errors"].append(
-                        f"height {blk.index}: state root mismatch "
-                        f"(state tampered?)")
-            # Compare on-disk file hash to in-memory recomputed hash.
-            disk = read_json(self.paths.block_path(blk.index))
-            if disk is not None:
-                disk_blk = Block.from_dict(disk)
-                disk_blk.recompute_hash()
-                if disk_blk.hash != blk.hash:
-                    report["errors"].append(
-                        f"height {blk.index}: on-disk block hash mismatch "
-                        f"(block tampered?)")
-            prev = blk
-        report["valid"] = not report["errors"]
+                ok, reason = blk.validate_structure()
+                if not ok:
+                    entry["issues"].append({
+                        "code": "structure",
+                        "message": self._REASON_ZH.get(reason, reason),
+                    })
+                # 3. Difficulty schedule (needs the contiguous prefix view).
+                if view_valid and prev_block is not None:
+                    view = _DiskChainView(view_blocks, self.genesis_difficulty)
+                    expected = pow_mod.next_difficulty(view, blk)
+                    if blk.difficulty != expected:
+                        entry["issues"].append({
+                            "code": "difficulty",
+                            "message": f"难度 {blk.difficulty} 与计划值 "
+                                       f"{expected} 不符",
+                        })
+                # 4. Transaction signatures / sender authenticity.
+                for tx in blk.transactions:
+                    if tx.is_coinbase():
+                        if tx.amount != COINBASE_REWARD:
+                            entry["issues"].append({
+                                "code": "coinbase_reward",
+                                "message": "coinbase 奖励金额不符",
+                            })
+                        continue
+                    if not tx.validate_signature():
+                        entry["issues"].append({
+                            "code": "signature",
+                            "message": f"交易 {tx.txid[:16]}… 签名无效",
+                        })
+                    elif tx.derived_sender() != tx.sender:
+                        entry["issues"].append({
+                            "code": "sender",
+                            "message": f"交易 {tx.txid[:16]}… 发送方与公钥不符",
+                        })
+
+            # 5. Stored state snapshot vs. the committed state root.
+            snap = read_json(self.paths.state_path(h))
+            if snap is None:
+                entry["issues"].append({
+                    "code": "state_missing",
+                    "message": "状态快照缺失或无法解析",
+                })
+            else:
+                try:
+                    stored_state = WorldState.from_dict(snap)
+                    if stored_state.root() != blk.header.state_root:
+                        entry["issues"].append({
+                            "code": "state_root",
+                            "message": "状态根与快照不符（状态文件可能被篡改）",
+                        })
+                except Exception:  # noqa: BLE001
+                    entry["issues"].append({
+                        "code": "state_missing",
+                        "message": "状态快照无法解析",
+                    })
+
+            # 6. On-disk block vs. the loaded in-memory chain (tamper check).
+            if h <= self.height:
+                mem = self.get_block(h)
+                if mem is not None:
+                    disk_hash = blk.recompute_hash()
+                    if disk_hash != mem.hash:
+                        entry["issues"].append({
+                            "code": "disk_mismatch",
+                            "message": "磁盘区块与节点已加载的不一致"
+                                       "（文件可能被篡改）",
+                        })
+
+            if entry["issues"]:
+                entry["status"] = "corrupt"
+            report["blocks"].append(entry)
+            prev_block = blk
+            prev_broken = False
+            view_blocks.append(blk)
+
+        report["corrupt"] = [b["height"] for b in report["blocks"]
+                             if b["status"] == "corrupt"]
+        report["valid"] = not report["corrupt"]
+        report["errors"] = [
+            f"高度 {b['height']}: {issue['message']}"
+            for b in report["blocks"] if b["status"] == "corrupt"
+            for issue in b["issues"]
+        ]
         return report
+
+    def validate_full_chain(self):
+        """Legacy summary view of :meth:`validate_chain_detailed`."""
+        report = self.validate_chain_detailed()
+        return {"valid": report["valid"], "checked": report["checked"],
+                "errors": report["errors"]}
+
+    # ==================================================================== #
+    # Quarantine: isolate damaged blocks (reversible)
+    # ==================================================================== #
+    def quarantine_records(self, public=False):
+        """All quarantine batches (newest last), including restored ones.
+
+        ``public=True`` strips the internal ``txs`` payload (transactions
+        harvested for pool re-admission) from each record.
+        """
+        data = read_json(self.paths.quarantine_index_path, {"batches": []})
+        batches = data.get("batches", [])
+        if not public:
+            return batches
+        out = []
+        for b in batches:
+            b = dict(b)
+            b.pop("txs", None)
+            out.append(b)
+        return out
+
+    def _save_quarantine_records(self, batches):
+        atomic_write_json(self.paths.quarantine_index_path,
+                          {"batches": batches})
+
+    def quarantine_public_summary(self):
+        """Active (un-restored) batches, for display in the block explorer."""
+        out = []
+        for b in self.quarantine_records():
+            if b.get("restored"):
+                continue
+            out.append({
+                "id": b["id"],
+                "from_height": b["from_height"],
+                "to_height": b["to_height"],
+                "reason": b.get("reason", ""),
+                "time": b.get("time"),
+            })
+        return out
+
+    def quarantined_height(self, height):
+        """Return the active batch isolating ``height``, if any."""
+        for b in self.quarantine_public_summary():
+            if b["from_height"] <= height <= b["to_height"]:
+                return b
+        return None
+
+    def quarantine(self, height, reason="", issues=None):
+        """Isolate blocks ``[height..]`` and roll the chain back if needed.
+
+        Two situations are handled uniformly:
+
+        * ``height`` is on the loaded main chain — the chain is truncated to
+          ``height - 1`` (state restored from the snapshot there) and can
+          keep browsing and mining from that point;
+        * ``height`` is above the chain head — the chain was already
+          truncated by a tolerant :meth:`load`, and the leftover (unloadable)
+          block files on disk are isolated.
+
+        In both cases the affected block/state files are *moved* into a
+        quarantine batch directory (never deleted), so the operation can be
+        undone later via :meth:`restore_quarantine`.  Transactions found in
+        the isolated blocks are collected into ``batch["txs"]`` so the caller
+        can re-admit them into the transaction pool.
+
+        Returns ``(ok, message, batch)``.
+        """
+        if height <= 0:
+            return False, "不允许隔离创世块", None
+        disk_heights = self._disk_block_heights()
+        max_disk = max(disk_heights + [-1])
+        if height > max(self.height, max_disk):
+            return False, (f"高度 {height} 超出当前链范围"
+                           f"（链高 {self.height}）"), None
+        rollback = height <= self.height
+        if rollback and not os.path.exists(self.paths.state_path(height - 1)):
+            return False, (f"高度 {height - 1} 的状态快照缺失，"
+                           f"无法安全回滚到隔离点之前"), None
+
+        head_height = max(self.height, max_disk)
+        head_hash_before = self.head.hash if self.head else None
+        batch_id = (time.strftime("q%Y%m%d-%H%M%S") + f"-h{height}-"
+                    + uuid.uuid4().hex[:6])
+        batch_dir = os.path.join(self.paths.quarantine_dir, batch_id)
+        os.makedirs(os.path.join(batch_dir, "blocks"), exist_ok=True)
+        os.makedirs(os.path.join(batch_dir, "state"), exist_ok=True)
+
+        moved = []
+        txs = []
+        for h in range(height, head_height + 1):
+            bp = self.paths.block_path(h)
+            if os.path.exists(bp):
+                # Best-effort: harvest transactions for pool re-admission
+                # before the file disappears into the quarantine area.
+                try:
+                    data = read_json(bp)
+                    if data:
+                        blk = Block.from_dict(data)
+                        txs.extend(tx.to_dict() for tx in blk.transactions
+                                   if not tx.is_coinbase())
+                except Exception:  # noqa: BLE001 - damaged file, skip
+                    pass
+                shutil.move(bp, os.path.join(batch_dir, "blocks",
+                                             "%06d.json" % h))
+                moved.append(h)
+            sp = self.paths.state_path(h)
+            if os.path.exists(sp):
+                shutil.move(sp, os.path.join(batch_dir, "state",
+                                             "%06d.json" % h))
+
+        batch = {
+            "id": batch_id,
+            "from_height": height,
+            "to_height": head_height,
+            "heights": moved,
+            "reason": reason or "",
+            "issues": issues or [],
+            "txs": txs,
+            "time": time.time(),
+            "head_hash_before": head_hash_before,
+            "restored": False,
+            "restored_at": None,
+        }
+
+        if rollback:
+            # Roll the in-memory chain back to just before the gap.
+            state_data = read_json(self.paths.state_path(height - 1))
+            self.state = WorldState.from_dict(state_data)
+            self.chain = self.chain[:height]
+            self.chainwork = self.cumulative_work_of(self.chain)
+            # Fork entries at/above the gap can never become main chain now.
+            self.fork_store = {h: bs for h, bs in self.fork_store.items()
+                               if h < height}
+        self._write_meta()
+        self.versions.record(self.height, self.head.hash,
+                             meta={"op": "quarantine", "batch": batch_id})
+
+        batches = self.quarantine_records()
+        batches.append(batch)
+        self._save_quarantine_records(batches)
+        # The load-time problems this quarantine addresses are now handled.
+        self.load_errors = [
+            e for e in self.load_errors
+            if e.get("height") is not None and e["height"] < height
+        ]
+        return True, (f"已隔离高度 {height}–{head_height} 共 {len(moved)} 个区块"
+                      f"（批次 {batch_id}），链当前高度 {self.height}"), batch
+
+    def restore_quarantine(self, batch_id):
+        """Undo a quarantine batch: move its files back and reload the chain.
+
+        Only possible while no new blocks have been mined over the gap.
+        Restoring reinstates the exact pre-quarantine state — including any
+        still-damaged files, which the next validation report will flag again.
+        """
+        batches = self.quarantine_records()
+        batch = next((b for b in batches if b["id"] == batch_id), None)
+        if batch is None:
+            return False, "隔离批次不存在"
+        if batch.get("restored"):
+            return False, "该批次已被恢复过"
+        if self.height >= batch["from_height"]:
+            return False, (f"隔离位置（高度 {batch['from_height']}）之后已有"
+                           f"新区块，请先回滚到高度 "
+                           f"{batch['from_height'] - 1} 再撤销隔离")
+
+        batch_dir = os.path.join(self.paths.quarantine_dir, batch_id)
+        if not os.path.isdir(batch_dir):
+            return False, "隔离区文件已丢失（批次目录不存在），无法恢复"
+        for sub, target in (("blocks", self.paths.blocks_dir),
+                            ("state", self.paths.state_dir)):
+            src_dir = os.path.join(batch_dir, sub)
+            if not os.path.isdir(src_dir):
+                continue
+            for f in os.listdir(src_dir):
+                shutil.move(os.path.join(src_dir, f),
+                            os.path.join(target, f))
+        shutil.rmtree(batch_dir, ignore_errors=True)
+
+        # Point meta back at the restored head and reload tolerantly: if the
+        # restored files still contain a damaged block, the chain truncates
+        # just before it — exactly the pre-quarantine situation.
+        meta = read_json(self.paths.meta_path, {})
+        meta["height"] = batch["to_height"]
+        atomic_write_json(self.paths.meta_path, meta)
+        self.load()
+
+        batch["restored"] = True
+        batch["restored_at"] = time.time()
+        self._save_quarantine_records(batches)
+        self.versions.record(self.height, self.head.hash,
+                             meta={"op": "restore_quarantine",
+                                   "batch": batch_id})
+        return True, f"已撤销隔离批次 {batch_id}，链恢复到高度 {self.height}"

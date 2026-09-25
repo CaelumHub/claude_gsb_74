@@ -14,7 +14,16 @@
   .blk .n { font-family: var(--mono); font-weight: 700; color: var(--accent-2); }
   .blk .t { font-size: 10px; color: var(--faint); }
   .blk.genesis { border-color: var(--purple); }
+  .blk.quarantined { border: 1px dashed var(--red); background: rgba(248,113,113,.10);
+    cursor: default; }
+  .blk.quarantined:hover { transform: none; border-color: var(--red); }
+  .blk.quarantined .n { color: var(--red); }
   .chain-link { color: var(--faint); font-size: 14px; }
+  .quarantine-banner { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 10px 14px; border-radius: 10px; margin-top: 12px;
+    background: rgba(248,113,113,.10); border: 1px solid var(--red); }
+  .quarantine-banner .qtitle { color: var(--red); font-weight: 700; }
+  .quarantine-banner .qdetail { color: var(--muted); font-size: 12.5px; }
 </style>
 </head>
 <body>
@@ -43,6 +52,7 @@
                  placeholder="输入区块哈希 / 高度 / 交易ID 查询" onkeydown="if(event.key==='Enter')doSearch()">
           <button class="btn primary" onclick="doSearch()">🔍 查询</button>
         </div>
+        <div id="quarantineBanner"></div>
         <div id="chainViz" class="chain-row" style="margin-top:14px; overflow-x:auto; padding:6px 2px;"></div>
       </div>
 
@@ -61,6 +71,7 @@
 <script>
 window.PAGE = "explorer";
 let chain = [];
+let quarantined = [];
 
 async function init() {
   await loadChain();
@@ -70,8 +81,10 @@ async function init() {
 async function loadChain() {
   const d = await API.get("/api/chain");
   chain = d.blocks;
+  quarantined = d.quarantined || [];
   $("#height").textContent = "#" + d.height;
   $("#chainwork").textContent = d.chainwork.toLocaleString();
+  renderQuarantineBanner();
   renderChainViz();
   renderBlockTable();
   // totals
@@ -80,21 +93,46 @@ async function loadChain() {
   $("#contracts").textContent = st.contracts;
 }
 
+function renderQuarantineBanner() {
+  const box = $("#quarantineBanner");
+  if (!quarantined.length) { box.innerHTML = ""; return; }
+  box.innerHTML = quarantined.map(q => `
+    <div class="quarantine-banner">
+      <span class="qtitle">🚫 高度 #${q.from_height} – #${q.to_height} 的区块已被隔离</span>
+      <span class="qdetail">共 ${q.to_height - q.from_height + 1} 个区块已移出主链（${fmt.time(q.time)}）${q.reason ? "，原因：" + esc(q.reason) : ""}。链从高度 #${q.from_height - 1} 继续出块，可在管理后台撤销恢复。</span>
+    </div>`).join("");
+}
+
 function renderChainViz() {
   const box = $("#chainViz");
   const latest = chain.slice(-40);
-  box.innerHTML = latest.map((b, i) => {
-    const link = i > 0 ? '<span class="chain-link">→</span>' : "";
-    return `${link}<div class="blk ${b.index === 0 ? 'genesis' : ''}" onclick="showBlock(${b.index})" title="#${b.index} ${b.hash}">
+  // 隔离缺口标记：插入到隔离起始高度之前的位置（隔离块已不在主链上）。
+  const gapAfter = {};
+  quarantined.forEach(q => { gapAfter[q.from_height - 1] = q; });
+  let html = "";
+  latest.forEach((b, i) => {
+    if (i > 0) html += '<span class="chain-link">→</span>';
+    html += `<div class="blk ${b.index === 0 ? 'genesis' : ''}" onclick="showBlock(${b.index})" title="#${b.index} ${b.hash}">
       <div class="n">${b.index === 0 ? '创世' : '#' + b.index}</div>
       <div class="t">${b.tx_count} tx</div>
     </div>`;
-  }).join("");
+    const q = gapAfter[b.index];
+    if (q) {
+      html += `<span class="chain-link">⇢</span>
+        <div class="blk quarantined" title="高度 #${q.from_height}–#${q.to_height} 已被隔离（批次 ${q.id}）">
+          <div class="n">🚫 #${q.from_height}${q.to_height > q.from_height ? '–' + q.to_height : ''}</div>
+          <div class="t">已隔离</div>
+        </div>`;
+    }
+  });
+  box.innerHTML = html;
   box.scrollLeft = box.scrollWidth;
 }
 
 function renderBlockTable() {
-  $("#listHint").textContent = `（共 ${chain.length} 个区块，最新在前）`;
+  const qNote = quarantined.length
+    ? `，<span style="color:var(--red);">🚫 ${quarantined.reduce((n, q) => n + (q.to_height - q.from_height + 1), 0)} 个区块已隔离</span>` : "";
+  $("#listHint").innerHTML = `（共 ${chain.length} 个区块，最新在前${qNote}）`;
   const rows = chain.slice().reverse().slice(0, 30);
   $("#blockTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
     <th>高度</th><th>哈希</th><th>前一哈希</th><th>交易数</th><th>难度</th><th>Nonce</th><th>时间</th></tr></thead>

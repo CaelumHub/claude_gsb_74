@@ -149,6 +149,7 @@ a:hover { text-decoration: underline; }
 .stat.green { border-top: 2px solid var(--green); }
 .stat.amber { border-top: 2px solid var(--amber); }
 .stat.purple { border-top: 2px solid var(--purple); }
+.stat.red { border-top: 2px solid var(--red); }
 
 /* ---------- Buttons ---------- */
 .btn {
@@ -163,6 +164,7 @@ a:hover { text-decoration: underline; }
   border-color: transparent; color: #fff; }
 .btn.primary:hover { filter: brightness(1.08); }
 .btn.green { background: linear-gradient(135deg, #10b981, #059669); border-color: transparent; color: #fff; }
+.btn.amber { background: linear-gradient(135deg, #f59e0b, #b45309); border-color: transparent; color: #fff; }
 .btn.danger { background: linear-gradient(135deg, #ef4444, #b91c1c); border-color: transparent; color: #fff; }
 .btn.ghost { background: transparent; }
 .btn.sm { padding: 6px 10px; font-size: 12px; }
