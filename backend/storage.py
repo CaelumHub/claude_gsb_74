@@ -128,11 +128,14 @@ class DataPaths:
         self.blocks_dir = os.path.join(root, _cfg.BLOCKS_SUBDIR)
         self.state_dir = os.path.join(root, _cfg.STATE_SUBDIR)
         self.contracts_dir = os.path.join(root, _cfg.CONTRACTS_SUBDIR)
+        self.quarantine_dir = os.path.join(root, _cfg.QUARANTINE_SUBDIR)
         self.meta_path = os.path.join(root, _cfg.META_FILE)
         self.txpool_path = os.path.join(root, _cfg.TXPOOL_FILE)
         self.wallets_path = os.path.join(root, _cfg.WALLETS_FILE)
         self.versions_path = os.path.join(root, _cfg.VERSIONS_FILE)
         self.logs_path = os.path.join(root, _cfg.LOGS_FILE)
+        self.quarantine_ops_path = os.path.join(
+            self.quarantine_dir, _cfg.QUARANTINE_OPS_FILE)
 
     def block_path(self, height):
         return os.path.join(self.blocks_dir, "%06d.json" % height)
@@ -144,5 +147,6 @@ class DataPaths:
         return os.path.join(self.contracts_dir, address + ".json")
 
     def ensure(self):
-        for d in (self.blocks_dir, self.state_dir, self.contracts_dir):
+        for d in (self.blocks_dir, self.state_dir, self.contracts_dir,
+                  self.quarantine_dir):
             ensure_dir(d)

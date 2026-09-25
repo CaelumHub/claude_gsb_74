@@ -14,6 +14,17 @@
   .blk .n { font-family: var(--mono); font-weight: 700; color: var(--accent-2); }
   .blk .t { font-size: 10px; color: var(--faint); }
   .blk.genesis { border-color: var(--purple); }
+  .blk.quarantined { border: 1px solid var(--red);
+    background: rgba(248,113,113,.12); box-shadow: 0 0 10px rgba(248,113,113,.35); }
+  .blk.quarantined .n { color: var(--red); }
+  .blk.detached { border: 1px dashed var(--amber);
+    background: rgba(251,191,36,.10); }
+  .blk.detached .n { color: var(--amber); }
+  .blk.replaced { opacity: .55; }
+  .blk .qico { font-size: 11px; line-height: 1.2; }
+  tr.row-quarantined td { background: rgba(248,113,113,.08); }
+  tr.row-detached td { background: rgba(251,191,36,.06); }
+  .chain-link.broken { color: var(--red); font-weight: 700; }
   .chain-link { color: var(--faint); font-size: 14px; }
 </style>
 </head>
@@ -32,8 +43,11 @@
         <div class="card stat accent"><div class="label">区块高度</div><div class="value" id="height">—</div></div>
         <div class="card stat green"><div class="label">累计工作量</div><div class="value small" id="chainwork">—</div></div>
         <div class="card stat amber"><div class="label">总交易数</div><div class="value" id="totalTx">—</div></div>
-        <div class="card stat purple"><div class="label">合约数量</div><div class="value" id="contracts">—</div></div>
+        <div class="card stat purple"><div class="label">隔离/脱落区块</div><div class="value" id="isolatedCount">0</div></div>
       </div>
+
+      <div id="isolationBanner" class="card"
+           style="margin-top:16px; border-left:3px solid var(--red); display:none;"></div>
 
       <div class="card" style="margin-top:16px;">
         <div class="flex">
@@ -72,54 +86,118 @@ async function loadChain() {
   chain = d.blocks;
   $("#height").textContent = "#" + d.height;
   $("#chainwork").textContent = d.chainwork.toLocaleString();
+  const isolated = chain.filter(b => b.status === "quarantined" || b.status === "detached");
+  $("#isolatedCount").textContent = isolated.length;
+  renderIsolationBanner(chain, isolated, d.damaged_heights || []);
   renderChainViz();
   renderBlockTable();
   // totals
   const st = await API.get("/api/stats/overview");
   $("#totalTx").textContent = st.total_tx;
-  $("#contracts").textContent = st.contracts;
+}
+
+function statusBadge(status) {
+  if (status === "quarantined") return `<span class="badge red">⛔ 已隔离</span>`;
+  if (status === "detached") return `<span class="badge amber">⚠ 已脱落</span>`;
+  return "";
+}
+
+function renderIsolationBanner(blocks, isolated, damagedHeights) {
+  const box = $("#isolationBanner");
+  if (!isolated.length && !damagedHeights.length) { box.style.display = "none"; return; }
+  let html = "";
+  if (damagedHeights.length) {
+    html += `<div style="margin-bottom:6px;"><span class="badge red">⛔ 存在未处理的损坏区块 ${damagedHeights.map(h => "#" + h).join("、")}</span>
+      <span class="muted small">出块已暂停，请到「管理后台」执行逐块校验与隔离。</span></div>`;
+  }
+  const q = blocks.filter(b => b.status === "quarantined");
+  const dt = blocks.filter(b => b.status === "detached");
+  if (q.length) html += `<div class="small" style="color:var(--red);margin-top:6px;">⛔ 已隔离（损坏）：${q.map(b => "#" + b.index).join("、")}</div>`;
+  if (dt.length) html += `<div class="small" style="color:var(--amber);margin-top:4px;">⚠ 已脱落（完好但暂存）：${dt.map(b => "#" + b.index).join("、")}　<span class="muted">可在管理后台撤销隔离恢复</span></div>`;
+  box.innerHTML = html;
+  box.style.display = "block";
 }
 
 function renderChainViz() {
   const box = $("#chainViz");
   const latest = chain.slice(-40);
   box.innerHTML = latest.map((b, i) => {
-    const link = i > 0 ? '<span class="chain-link">→</span>' : "";
-    return `${link}<div class="blk ${b.index === 0 ? 'genesis' : ''}" onclick="showBlock(${b.index})" title="#${b.index} ${b.hash}">
-      <div class="n">${b.index === 0 ? '创世' : '#' + b.index}</div>
-      <div class="t">${b.tx_count} tx</div>
+    const isIso = (b.status === "quarantined" || b.status === "detached");
+    const broken = isIso;
+    const link = i > 0 ? `<span class="chain-link${broken ? " broken" : ""}">${broken ? "⊘" : "→"}</span>` : "";
+    const label = b.status === "quarantined" ? '<div class="qico">⛔隔离</div>'
+      : b.status === "detached" ? '<div class="qico">⚠脱落</div>'
+      : `<div class="t">${b.tx_count == null ? "—" : b.tx_count + " tx"}</div>`;
+    const target = (isIso && b.hash) ? `'${b.hash}'` : b.index;
+    const title = isIso && b.replaced ? `#${b.index}（已被新块顶替的隔离副本）` : `#${b.index}`;
+    return `${link}<div class="blk ${b.index === 0 ? 'genesis' : ''} ${b.status || ''} ${b.replaced ? 'replaced' : ''}" onclick="showBlock(${target})"
+      title="${title} ${b.hash || ''}&#10;${b.reason || ''}">
+      <div class="n">${b.index === 0 ? '创世' : '#' + b.index}</div>${label}
     </div>`;
   }).join("");
   box.scrollLeft = box.scrollWidth;
 }
 
 function renderBlockTable() {
-  $("#listHint").textContent = `（共 ${chain.length} 个区块，最新在前）`;
-  const rows = chain.slice().reverse().slice(0, 30);
+  const isolated = chain.filter(b => b.status === "quarantined" || b.status === "detached");
+  const shown = chain.slice().reverse().slice(0, 30);
+  $("#listHint").innerHTML = `（共 ${chain.length} 个区块，最新在前${isolated.length ? `，<span style="color:var(--red);">含 ${isolated.length} 个隔离/脱落区块</span>` : ""}）`;
   $("#blockTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
-    <th>高度</th><th>哈希</th><th>前一哈希</th><th>交易数</th><th>难度</th><th>Nonce</th><th>时间</th></tr></thead>
-    <tbody>${rows.map(b => `
-      <tr class="clickable" onclick="showBlock(${b.index})">
-        <td class="mono-num" style="color:var(--accent-2);">${b.index === 0 ? '创世' : '#' + b.index}</td>
+    <th>高度</th><th>状态</th><th>哈希</th><th>前一哈希</th><th>交易数</th><th>难度</th><th>Nonce</th><th>时间</th></tr></thead>
+    <tbody>${shown.map(b => {
+      const isIso = b.status === "quarantined" || b.status === "detached";
+      const target = (isIso && b.hash) ? `'${b.hash}'` : b.index;
+      return `
+      <tr class="clickable row-${b.status || ''}" onclick="showBlock(${target})">
+        <td class="mono-num" style="color:${b.status === 'quarantined' ? 'var(--red)' : 'var(--accent-2)'};">${b.index === 0 ? '创世' : '#' + b.index}${b.replaced ? ' <span class="badge gray" style="font-size:10px;">隔离副本</span>' : ""}</td>
+        <td>${statusBadge(b.status) || '<span class="muted small">正常</span>'}</td>
         <td class="hash">${fmt.hash(b.hash, 10)}</td>
         <td class="hash">${fmt.hash(b.prev_hash, 8)}</td>
-        <td class="mono-num">${b.tx_count}</td>
-        <td class="mono-num">${b.difficulty}</td>
-        <td class="mono-num">${b.nonce}</td>
-        <td class="muted small">${fmt.ago(b.timestamp)}</td>
-      </tr>`).join("")}</tbody></table></div>`;
+        <td class="mono-num">${b.tx_count == null ? "—" : b.tx_count}</td>
+        <td class="mono-num">${b.difficulty == null ? "—" : b.difficulty}</td>
+        <td class="mono-num">${b.nonce == null ? "—" : b.nonce}</td>
+        <td class="muted small">${b.timestamp ? fmt.ago(b.timestamp) : "—"}</td>
+      </tr>`;}).join("")}</tbody></table></div>`;
 }
 
 async function showBlock(identifier) {
   const d = await API.get("/api/block/" + identifier);
   if (!d.ok) return toast(d.error, "err");
+  const q = d.quarantine;
+  if (!d.block) {
+    // Quarantined block whose payload is corrupt beyond parsing.
+    $("#detailCard").style.display = "block";
+    $("#detailCard").innerHTML = `
+      <div class="flex"><h2 style="margin:0;">区块 #${identifier}</h2>
+        <div class="spacer"></div>${statusBadge(d.status)}
+        <button class="btn ghost sm" onclick="document.getElementById('detailCard').style.display='none'">关闭</button></div>
+      <div style="margin-top:12px;"><div class="badge red">⛔ 文件损坏到无法解析</div>
+        <p class="hint">该区块文件已被隔离，原始文件保留在隔离区，可在管理后台撤销恢复。</p>
+        ${q ? `<div class="small muted">隔离操作：<span class="mono">${esc(q.op_id)}</span></div>` : ""}
+      </div>`;
+    $("#detailCard").scrollIntoView({ behavior: "smooth" });
+    return;
+  }
   const b = d.block;
   const h = b.header;
+  const banner = d.isolated ? `
+    <div style="margin:0 0 12px 0; padding:10px 12px; border-radius:8px;
+      background:${d.status === 'quarantined' ? 'rgba(248,113,113,.12)' : 'rgba(251,191,36,.10)'};
+      border:1px solid ${d.status === 'quarantined' ? 'var(--red)' : 'var(--amber)'};">
+      ${statusBadge(d.status)}
+      <span class="small muted" style="margin-left:8px;">
+        ${d.status === 'quarantined'
+          ? '该区块经校验确认损坏，已从主链隔离；主链从隔离点继续运行，其他区块不受影响。可在管理后台撤销隔离。'
+          : '该区块文件本身完好，但因上游区块损坏而从主链脱落暂存；撤销隔离后将自动回到链上。'}
+      </span>
+      ${q && q.reason ? `<div class="small mono" style="margin-top:6px;color:var(--red);">${esc(q.reason)}</div>` : ""}
+    </div>` : "";
   $("#detailCard").style.display = "block";
   $("#detailCard").innerHTML = `
     <div class="flex"><h2 style="margin:0;">区块 #${h.index}</h2>
-      <div class="spacer"></div>
+      <div class="spacer"></div>${d.isolated ? statusBadge(d.status) : ""}
       <button class="btn ghost sm" onclick="document.getElementById('detailCard').style.display='none'">关闭</button></div>
+    ${banner}
     <div class="grid cols-2" style="margin-top:12px;">
       <div><dl class="kv">
         <dt>区块哈希</dt><dd class="hash">${esc(h.hash)}</dd>

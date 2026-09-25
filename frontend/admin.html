@@ -14,24 +14,45 @@
     <main class="content">
       <div class="page-head">
         <h1>管理后台</h1>
-        <p>链完整性校验、版本回滚、重置、分叉状态与节点日志。</p>
+        <p>逐块损坏定位报告、隔离与撤销恢复、版本回滚、重置与节点日志。</p>
       </div>
 
       <div class="grid cols-4">
         <div class="card stat accent"><div class="label">区块高度</div><div class="value" id="height">—</div></div>
         <div class="card stat green"><div class="label">累计工作量</div><div class="value small" id="chainwork">—</div></div>
-        <div class="card stat amber"><div class="label">分叉分支</div><div class="value" id="forkBranches">—</div></div>
-        <div class="card stat purple"><div class="label">版本记录</div><div class="value" id="versionCount">—</div></div>
+        <div class="card stat amber" id="damagedStatCard"><div class="label">损坏/脱落区块</div><div class="value" id="damagedCount">0</div></div>
+        <div class="card stat purple"><div class="label">已隔离区块 / 操作</div><div class="value small" id="isolatedStat">0 / 0</div></div>
+      </div>
+
+      <div id="damageBanner" class="card"
+           style="margin-top:16px; border-left:3px solid var(--red); display:none;"></div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="flex">
+          <h2 style="margin:0;">逐块校验报告</h2>
+          <div class="spacer"></div>
+          <button class="btn primary" onclick="runValidate()">🔒 执行逐块校验</button>
+        </div>
+        <p class="hint" style="margin:6px 0;">对每个区块文件独立检查：可解析性、区块哈希、PoW、Merkle 根、交易签名、难度规则、状态快照根以及链式链接，并区分「区块本身损坏」与「因上游损坏而脱落的完好区块」。</p>
+        <div id="validateSummary" style="margin-top:8px;"></div>
+        <div id="blockReport" class="table-wrap" style="margin-top:12px;"></div>
+        <div class="flex" style="margin-top:12px;" id="quarantineActions">
+          <div class="spacer"></div>
+          <button class="btn danger" id="quarantineBtn" onclick="quarantineSelected()" disabled>⛔ 隔离选中的损坏块</button>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="flex">
+          <h2 style="margin:0;">隔离操作记录（可撤销恢复）</h2>
+          <div class="spacer"></div>
+          <button class="btn ghost sm" onclick="loadOperations()">刷新</button>
+        </div>
+        <p class="hint" style="margin:6px 0;">隔离会把损坏块文件移入隔离区、把其下游完好块标记为脱落暂存；任何一次操作都可以事后撤销，把原始文件恢复回链目录。若已在隔离点之后挖出新区块（链已分叉），恢复会被拒绝以防覆盖新数据。</p>
+        <div id="opsTable" class="table-wrap" style="margin-top:12px;"></div>
       </div>
 
       <div class="grid" style="grid-template-columns: 1fr 1fr; margin-top:16px;">
-        <div class="card">
-          <h2>链完整性校验（防篡改）</h2>
-          <p class="hint" style="margin:6px 0;">逐块重算哈希、校验链接、签名、难度与状态根，检测区块/状态文件是否被篡改。</p>
-          <button class="btn primary" onclick="runValidate()">🔒 执行全链校验</button>
-          <div id="validateResult" style="margin-top:12px;"></div>
-        </div>
-
         <div class="card">
           <h2>危险操作</h2>
           <p class="hint" style="margin:6px 0;">回滚会丢弃目标高度以上的区块；重置会将整条链还原为创世块。二者均不可逆。</p>
@@ -40,6 +61,14 @@
             <button class="btn danger" onclick="doReset()">💣 重置整条链</button>
           </div>
           <div id="dangerResult" style="margin-top:12px;"></div>
+        </div>
+        <div class="card">
+          <h2>说明：损坏隔离 vs 回滚</h2>
+          <ul class="small muted" style="margin:8px 0 0 18px; line-height:1.9;">
+            <li><b style="color:var(--red);">隔离</b>：精确定位到具体损坏块，仅移走损坏文件；其下游完好块<b>不删除</b>而是脱落暂存，事后可一键撤销恢复。</li>
+            <li>隔离后链停在最后一个完好块并可立即继续出块，其他正常区块不受影响。</li>
+            <li><b style="color:var(--amber);">回滚</b>：直接删除某高度以上的全部区块与状态，不可恢复。</li>
+          </ul>
         </div>
       </div>
 
@@ -70,28 +99,54 @@
 <script>
 window.PAGE = "admin";
 let versions = [];
+let reportBlocks = [];
+let lastReport = null;
+
+const STATUS_META = {
+  damaged:      { label: "损坏",   badge: "red",    selectable: true  },
+  orphan:       { label: "脱落",   badge: "amber",  selectable: false },
+  missing:      { label: "缺失",   badge: "red",    selectable: false },
+  state_damaged:{ label: "状态损坏", badge: "purple", selectable: false },
+  quarantined:  { label: "已隔离", badge: "red",    selectable: false },
+  detached:     { label: "已脱落", badge: "amber",  selectable: false },
+  ok:           { label: "正常",   badge: "green",  selectable: false },
+};
 
 async function init() {
   await loadStatus();
   await loadVersions();
   await loadLogs();
+  await loadOperations();
+  await runValidate();
   pollStatus(8000);
 }
 
 async function loadStatus() {
   const s = await API.get("/api/node/status");
-  const a = await API.get("/api/admin/status");
   $("#height").textContent = "#" + s.height;
   $("#chainwork").textContent = (s.chainwork || 0).toLocaleString();
-  const forkHeights = Object.keys(a.fork_store || {}).length;
-  $("#forkBranches").textContent = forkHeights;
-  $("#versionCount").textContent = a.status.accounts + " 账户 / " + a.status.contracts + " 合约";
+  const damaged = (s.damaged_heights || []).length;
+  $("#damagedCount").textContent = damaged;
+  $("#damagedStatCard").style.opacity = damaged ? "1" : ".55";
+  $("#isolatedStat").textContent = (s.isolated_count || 0) + " / " +
+    (window._opsCount == null ? "—" : window._opsCount);
+  renderDamageBanner(s);
+}
+
+function renderDamageBanner(s) {
+  const box = $("#damageBanner");
+  const hs = s.damaged_heights || [];
+  if (!hs.length) { box.style.display = "none"; return; }
+  box.innerHTML = `
+    <div><span class="badge red">⛔ 链上存在未处理的损坏区块 ${hs.map(h => "#" + h).join("、")}</span></div>
+    <div class="small muted" style="margin-top:8px;">节点已自动停在最后一个完好块（<b>#${s.height}</b>），<b>出块已暂停</b>以防覆盖证据；正常区块浏览不受影响。
+    请在下方执行逐块校验，确认报告后将损坏块隔离，即可从 <b>#${s.height}</b> 继续出块。</div>`;
+  box.style.display = "block";
 }
 
 async function loadVersions() {
   const d = await API.get("/api/admin/versions");
   versions = d.versions;
-  $("#versionCount").textContent = versions.length;
   const sel = $("#rollbackHeight");
   const heights = [...new Set(versions.map(v => v.height))].sort((a, b) => a - b);
   sel.innerHTML = heights.map(h => `<option value="${h}">高度 #${h}</option>`).join("");
@@ -110,17 +165,173 @@ async function loadVersions() {
 }
 
 async function runValidate() {
-  $("#validateResult").innerHTML = `<span class="muted">校验中…</span>`;
-  const r = await API.get("/api/admin/validate");
-  if (r.valid) {
-    $("#validateResult").innerHTML = `
-      <div class="flex"><span class="badge green">✓ 链完整，无篡改</span>
-        <span class="muted small">已校验 ${r.checked} 个区块</span></div>`;
-  } else {
-    $("#validateResult").innerHTML = `
-      <div><span class="badge red">✗ 发现 ${r.errors.length} 处异常</span></div>
-      <ul style="margin:10px 0 0 20px;">${r.errors.map(e => `<li class="small mono" style="color:var(--red);margin:3px 0;">${esc(e)}</li>`).join("")}</ul>`;
+  $("#blockReport").innerHTML = `<div class="empty">校验中…</div>`;
+  let r;
+  try {
+    r = await API.get("/api/chain/damage");
+  } catch (e) {
+    $("#blockReport").innerHTML = `<div class="empty" style="color:var(--red);">校验失败：${esc(e.message)}</div>`;
+    return;
   }
+  lastReport = r;
+  renderReport(r);
+  await loadStatus();
+}
+
+function renderReport(r) {
+  const damaged = (r.blocks || []).filter(b => b.status === "damaged");
+  const orphans = (r.blocks || []).filter(b => b.status === "orphan");
+  const stateBad = (r.blocks || []).filter(b => b.status === "state_damaged");
+  const isolated = (r.blocks || []).filter(b => b.status === "quarantined" || b.status === "detached");
+
+  let summary;
+  if (r.valid && !isolated.length) {
+    summary = `<div class="flex"><span class="badge green">✓ 链完整，未发现损坏</span>
+      <span class="muted small">已逐块校验 ${r.checked} 个区块，当前有效高度 #${r.active_height}</span></div>`;
+  } else {
+    summary = `<div class="flex" style="gap:10px; flex-wrap:wrap;">
+      ${damaged.length ? `<span class="badge red">⛔ 损坏块 ${damaged.length}</span>` : ""}
+      ${orphans.length ? `<span class="badge amber">⚠ 脱落块 ${orphans.length}</span>` : ""}
+      ${stateBad.length ? `<span class="badge purple">状态快照异常 ${stateBad.length}（可自动重建）</span>` : ""}
+      ${isolated.length ? `<span class="badge gray">已隔离/脱落暂存 ${isolated.length}</span>` : ""}
+      <span class="muted small">有效链高度 #${r.active_height} · 共检查 ${r.checked} 个区块</span>
+    </div>`;
+  }
+  $("#validateSummary").innerHTML = summary;
+
+  const blocks = r.blocks || [];
+  if (!blocks.length) {
+    $("#blockReport").innerHTML = `<div class="empty">所有区块均正常</div>`;
+    $("#quarantineBtn").disabled = true;
+    return;
+  }
+  $("#blockReport").innerHTML = `<table><thead><tr>
+    <th style="width:36px;">选择</th><th>高度</th><th>状态</th><th>问题明细（逐块）</th><th>区块哈希</th><th>隔离操作</th>
+    </tr></thead><tbody>${blocks.map(b => rowHtml(b)).join("")}</tbody></table>`;
+  updateQuarantineBtn();
+}
+
+function rowHtml(b) {
+  const meta = STATUS_META[b.status] || { label: b.status, badge: "gray" };
+  const problems = (b.errors || []).map(e =>
+    `<div class="small" style="margin:2px 0;"><span class="mono" style="color:var(--red);">●</span>
+      ${esc(e.message)}${e.detail ? ` <span class="muted">— ${esc(e.detail)}</span>` : ""}</div>`
+  ).join("");
+  const checkbox = meta.selectable
+    ? `<input type="checkbox" class="qpick" value="${b.height}" onchange="updateQuarantineBtn()" ${pickedByDefault(b) ? "checked" : ""}>`
+    : "";
+  const opCell = b.op_id
+    ? `<span class="mono small muted">${esc(b.op_id)}</span>${b.quarantined_at ? `<div class="muted" style="font-size:11px;">${fmt.time(b.quarantined_at)}</div>` : ""}`
+    : (b.status === "ok" ? '<span class="muted small">—</span>' : "");
+  return `<tr${b.status === "damaged" ? ' style="background:rgba(248,113,113,.07);"' :
+           b.status === "orphan" ? ' style="background:rgba(251,191,36,.05);"' : ""}>
+    <td>${checkbox}</td>
+    <td class="mono-num" style="color:${b.status === 'damaged' ? 'var(--red)' : 'var(--accent-2)'};font-weight:700;">#${b.height}</td>
+    <td><span class="badge ${meta.badge}">${meta.label}</span></td>
+    <td style="max-width:430px;">${problems || '<span class="muted small">无</span>'}</td>
+    <td class="hash" style="max-width:150px;">${fmt.hash(b.hash, 8)}</td>
+    <td>${opCell}</td>
+  </tr>`;
+}
+
+// A damaged block is pre-checked when it is the lowest damaged block (the
+// default safe action: isolate it and everything it invalidates).
+function pickedByDefault(b) {
+  const damaged = (lastReport.blocks || []).filter(x => x.status === "damaged");
+  return damaged.length && b.height === damaged[0].height;
+}
+
+function selectedHeights() {
+  return $$(".qpick:checked").map(c => parseInt(c.value));
+}
+
+function updateQuarantineBtn() {
+  const n = selectedHeights().length;
+  const btn = $("#quarantineBtn");
+  btn.disabled = n === 0;
+  btn.textContent = n ? `⛔ 隔离选中的 ${n} 个损坏块` : "⛔ 隔离选中的损坏块";
+}
+
+async function quarantineSelected() {
+  const heights = selectedHeights();
+  if (!heights.length) return toast("请先勾选损坏块", "err");
+  // Step 1: fetch the exact plan so the confirmation shows every consequence.
+  let plan;
+  try {
+    const d = await API.post("/api/chain/quarantine/plan", { heights });
+    plan = d.plan;
+  } catch (e) {
+    return toast("无法生成隔离计划：" + e.message, "err", 5000);
+  }
+  const qList = plan.quarantined.map(e =>
+    `#${e.height}（${(e.errors || []).map(x => x.message).join("；") || e.reason}）`).join("\n  ");
+  const dList = plan.detached.map(e => "#" + e.height).join("、") || "无";
+  const msg =
+    `请确认隔离操作：\n\n` +
+    `① 将隔离以下 ${plan.quarantine_count} 个确认损坏的区块（文件移入隔离区）：\n  ${qList}\n\n` +
+    `② 以下 ${plan.detach_count} 个下游区块文件本身完好，将标记为「脱落暂存」（不删除，可恢复）：\n  ${dList}\n\n` +
+    `③ 主链将停在高度 #${plan.truncate_height}，并可立即从该位置继续出块。\n` +
+    `隔离区中的交易将重新进入交易池。\n\n该操作事后可在下方「隔离操作记录」中一键撤销恢复。\n\n确定执行隔离？`;
+  if (!confirm(msg)) return;
+  let res;
+  try {
+    res = await API.post("/api/chain/quarantine",
+      { heights, confirm: true, note: "管理后台手动隔离" });
+  } catch (e) {
+    return toast("隔离失败：" + e.message, "err", 5000);
+  }
+  const readmitted = res.operation.tx_readmitted || 0;
+  toast(`已隔离 ${plan.quarantine_count} 个损坏块，${plan.detach_count} 个脱落暂存，链停在 #${res.height}，${readmitted} 笔交易回池`, "ok", 5000);
+  await runValidate();
+  await loadOperations();
+  await loadVersions();
+  renderTopbar();
+}
+
+async function loadOperations() {
+  const d = await API.get("/api/chain/quarantine/operations");
+  window._opsCount = d.operations.filter(o => o.active).length;
+  if (!d.operations.length) {
+    $("#opsTable").innerHTML = `<div class="empty">暂无隔离操作</div>`;
+    return;
+  }
+  $("#opsTable").innerHTML = `<table><thead><tr>
+    <th>状态</th><th>操作ID</th><th>隔离损坏块</th><th>脱落暂存</th><th>链截断点</th><th>时间</th><th>备注</th><th>操作</th>
+    </tr></thead><tbody>${d.operations.map(o => `
+      <tr${o.active ? "" : ' style="opacity:.55;"'}>
+        <td>${o.active ? '<span class="badge red">生效中</span>' : '<span class="badge gray">已撤销</span>'}</td>
+        <td class="mono small">${esc(o.id)}</td>
+        <td class="mono-num" style="color:var(--red);">${o.quarantine_count} 个<br><span class="small muted">${o.heights.filter(h => false).length ? "" : ""}${o.quarantine_count ? o.heights.slice(0, o.quarantine_count).map(h => "#" + h).join(" ") : ""}</span></td>
+        <td class="mono-num" style="color:var(--amber);">${o.detach_count} 个<br><span class="small muted">${o.detach_count ? o.heights.slice(o.quarantine_count).map(h => "#" + h).join(" ") : ""}</span></td>
+        <td class="mono-num">#${o.truncate_height}</td>
+        <td class="muted small">${fmt.time(o.time)}${o.undone_at ? `<br>撤销于 ${fmt.time(o.undone_at)}` : ""}</td>
+        <td class="small">${esc(o.note || "—")}</td>
+        <td>${o.active ? `<button class="btn ghost sm" onclick="restoreOp('${o.id}')">↩ 撤销恢复</button>` : "—"}</td>
+      </tr>`).join("")}</tbody></table>`;
+}
+
+async function restoreOp(opId) {
+  const ops = (await API.get("/api/chain/quarantine/operations")).operations;
+  const op = ops.find(o => o.id === opId);
+  if (!op) return;
+  if (!confirm(`确定撤销隔离操作 ${opId}？\n\n` +
+      `将把 ${op.quarantine_count} 个损坏块和 ${op.detach_count} 个脱落暂存块的原始文件恢复到链目录，` +
+      `并重新加载链。\n若这些区块仍然损坏，链会再次停在最后一个完好块（可重新隔离）；` +
+      `若隔离后已在截断点 #${op.truncate_height} 之后挖出新区块，恢复将被拒绝。`)) return;
+  try {
+    const d = await API.post(`/api/chain/quarantine/${opId}/restore`, { confirm: true });
+    if ((d.residual_damage || []).length) {
+      toast(`已恢复文件，但 #${(d.residual_damage || []).join("、#")} 仍未通过校验，链停在 #${d.height}`, "info", 5000);
+    } else {
+      toast(`隔离已撤销，链恢复至高度 #${d.height}`, "ok", 4000);
+    }
+  } catch (e) {
+    return toast("恢复被拒绝：" + e.message, "err", 6000);
+  }
+  await runValidate();
+  await loadOperations();
+  await loadVersions();
+  renderTopbar();
 }
 
 async function doRollback() {

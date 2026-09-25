@@ -55,6 +55,13 @@ class Node:
         self._register_configured_peers()
         self.log("info", f"node {self.node_id} started on port {self.port}, "
                          f"height {self.blockchain.height}")
+        if self.blockchain.startup_damage:
+            hs = ", ".join("#%d" % e["height"]
+                           for e in self.blockchain.startup_damage[:10])
+            self.log("warn",
+                     f"启动时发现 {len(self.blockchain.startup_damage)} 个"
+                     f"损坏/脱落区块（{hs}），链已停在最后一个完好块，"
+                     f"出块已暂停，等待校验隔离")
         if self.cfg.get("mine"):
             self.start_mining()
 
@@ -90,6 +97,19 @@ class Node:
     def mine_block(self, miner_address=None, wait=False):
         """Pack the mempool into a candidate block and mine it (foreground)."""
         with self._lock:
+            # Refuse to extend while damaged/raw block files sit beyond the
+            # tip: a freshly mined file at that height could overwrite the
+            # evidence.  The operator must quarantine (or otherwise resolve)
+            # the reported blocks first.
+            damage = self.blockchain.unprocessed_damage()
+            if damage:
+                heights = ", ".join("#%d" % e["height"] for e in
+                                    damage[:8])
+                more = " …" if len(damage) > 8 else ""
+                msg = (f"存在未处理的损坏区块（{heights}{more}），已暂停出块；"
+                       f"请先在管理后台完成逐块校验与隔离")
+                self.log("warn", msg)
+                return "blocked_by_damage", msg, self.blockchain.height
             miner = miner_address or (self.wallets.list()[0]["address"]
                                       if self.wallets.list() else ZERO_ADDRESS)
             candidates = self.txpool.all()[:MAX_TX_PER_BLOCK]
@@ -258,6 +278,80 @@ class Node:
                 if not tx.is_coinbase():
                     self.txpool.re_admit([tx])
         self.save_txpool()
+
+    # ================================================================== #
+    # Damage quarantine / restore orchestration
+    # ================================================================== #
+    def quarantine_plan(self, heights):
+        return self.blockchain.quarantine_plan(heights)
+
+    def quarantine_blocks(self, heights, note=""):
+        """Isolate damaged blocks and re-admit their transactions to the pool.
+
+        Returns ``(op, None)`` or ``(None, error)``.
+        """
+        with self._lock:
+            plan, err = self.blockchain.quarantine_plan(heights)
+            if err:
+                return None, err
+            # Re-admit transactions from parseable isolated/detached blocks so
+            # they can be repacked into blocks mined after the recovery point.
+            all_entries = plan["quarantined"] + plan["detached"]
+            re_admitted = 0
+            for entry in sorted(all_entries, key=lambda e: e["height"],
+                                reverse=True):
+                txs = self._parse_txs_in_block(entry["height"])
+                before = self.txpool.size()
+                self.txpool.re_admit(txs)
+                re_admitted += self.txpool.size() - before
+            op, err = self.blockchain.quarantine_blocks(heights, note=note)
+            if err:
+                return None, err
+            self.save_txpool()
+            self.sync_contract_files()
+            self.log("warn",
+                     f"已隔离 {plan['quarantine_count']} 个损坏区块，"
+                     f"{plan['detach_count']} 个下游区块已脱落暂存，"
+                     f"链停在高度 #{plan['truncate_height']}，"
+                     f"回捞交易 {re_admitted} 笔（操作 {op['id']}）")
+            op["tx_readmitted"] = re_admitted
+            return op, None
+
+    def restore_quarantine(self, op_id):
+        """Undo a quarantine operation; remove restored txs from the pool.
+
+        Returns ``(heights, residual_damage, None)`` or ``(None, None, error)``.
+        """
+        with self._lock:
+            heights, residual, err = self.blockchain.restore_operation(op_id)
+            if err:
+                return None, None, err
+            restored_txids = set()
+            for h in heights:
+                for tx in self._parse_txs_in_block(h):
+                    if not tx.is_coinbase():
+                        restored_txids.add(tx.txid)
+            for txid in restored_txids:
+                self.txpool.remove(txid)
+            self.save_txpool()
+            self.sync_contract_files()
+            self.log("info",
+                     f"已撤销隔离操作 {op_id}，恢复 {len(heights)} 个区块，"
+                     f"当前高度 #{self.blockchain.height}")
+            return heights, self.blockchain.startup_damage, None
+
+    def _parse_txs_in_block(self, height):
+        """Best-effort transaction extraction from a moved/raw block file."""
+        data = self.blockchain.quarantine.read_block_data(height)
+        if data is None:
+            data = read_json(self.paths.block_path(height))
+        if not data:
+            return []
+        try:
+            return [Transaction.from_dict(t)
+                    for t in data.get("transactions", [])]
+        except Exception:  # noqa: BLE001 - corrupt payload
+            return []
 
     def _record_events(self, receipts, height):
         """Append contract events from ``receipts`` to per-contract files."""

@@ -76,6 +76,8 @@ def create_app(node):
             "state_root": bc.state.root() if bc.head else None,
             "accounts": len(bc.state.accounts),
             "contracts": len(bc.state.contracts),
+            "isolated_count": len(bc.quarantine.active_blocks()),
+            "damaged_heights": [e["height"] for e in bc.unprocessed_damage()],
         })
 
     # ================================================================== #
@@ -294,9 +296,13 @@ def create_app(node):
     def chain_info():
         bc = node.blockchain
         blocks = bc.chain_summary()
+        isolated = bc.quarantine.active_blocks()
         return _json({"height": bc.height, "chainwork": bc.chainwork,
                       "genesis_difficulty": bc.genesis_difficulty,
-                      "blocks": blocks})
+                      "blocks": blocks,
+                      "isolated_count": len(isolated),
+                      "damaged_heights": [e["height"] for e in
+                                         bc.unprocessed_damage()]})
 
     @app.get("/api/blocks")
     def blocks_list():
@@ -317,14 +323,25 @@ def create_app(node):
     @app.get("/api/block/<identifier>")
     def block_detail(identifier):
         bc = node.blockchain
-        block = None
         if identifier.isdigit():
-            block = bc.get_block(int(identifier))
+            block, status = bc.get_any_block(int(identifier))
         else:
-            block = bc.get_block_by_hash(identifier)
-        if not block:
+            block, status = bc.get_any_block(identifier)
+        if status is None and block is None:
             return _json({"ok": False, "error": "block not found"}, 404)
-        return _json({"ok": True, "block": block.to_dict()})
+        if block is None:
+            # Quarantined block whose payload no longer parses.
+            info = bc.isolated_summary(int(identifier)) if identifier.isdigit() \
+                else None
+            return _json({"ok": True, "block": None,
+                          "isolated": True, "status": status,
+                          "info": info})
+        return _json({"ok": True, "block": block.to_dict(),
+                      "status": status,
+                      "isolated": status in ("quarantined", "detached"),
+                      "quarantine": (bc.isolated_summary(block.index)
+                                     if status in ("quarantined", "detached")
+                                     else None)})
 
     @app.get("/api/tx/<txid>")
     def tx_detail(txid):
@@ -343,6 +360,76 @@ def create_app(node):
     def chain_validate():
         report = node.blockchain.validate_full_chain()
         return _json(report)
+
+    # ------------------------------------------------------------------ #
+    # Per-block damage reports + quarantine / restore workflow
+    # ------------------------------------------------------------------ #
+    @app.get("/api/chain/damage")
+    def chain_damage():
+        """Detailed per-block validation report (problem blocks only)."""
+        report = node.blockchain.scan_blocks()
+        problem = [e for e in report["blocks"]
+                   if e["status"] not in ("ok",) or e["errors"]]
+        return _json({
+            "valid": report["valid"],
+            "chain_usable": report["chain_usable"],
+            "active_height": report["active_height"],
+            "checked": report["checked"],
+            "damaged_count": report["damaged_count"],
+            "orphan_count": report["orphan_count"],
+            "isolated_count": report["isolated_count"],
+            "blocks": problem,
+        })
+
+    @app.post("/api/chain/quarantine/plan")
+    def quarantine_plan():
+        data = request.get_json(force=True, silent=True) or {}
+        heights = data.get("heights") or []
+        try:
+            heights = [int(h) for h in heights]
+        except (TypeError, ValueError):
+            return _json({"ok": False, "error": "heights 必须是高度数组"}, 400)
+        plan, err = node.quarantine_plan(heights)
+        if err:
+            return _json({"ok": False, "error": err}, 400)
+        return _json({"ok": True, "plan": plan})
+
+    @app.post("/api/chain/quarantine")
+    def quarantine_isolate():
+        data = request.get_json(force=True, silent=True) or {}
+        heights = data.get("heights") or []
+        # Explicit confirmation is mandatory — the UI must show the plan first.
+        if not data.get("confirm"):
+            return _json({"ok": False,
+                          "error": "需要确认：请先获取隔离计划并带 confirm=true 提交"},
+                         400)
+        try:
+            heights = [int(h) for h in heights]
+        except (TypeError, ValueError):
+            return _json({"ok": False, "error": "heights 必须是高度数组"}, 400)
+        op, err = node.quarantine_blocks(heights, note=data.get("note", ""))
+        if err:
+            return _json({"ok": False, "error": err}, 400)
+        return _json({"ok": True, "operation": _operation_summary(op),
+                      "height": node.blockchain.height})
+
+    @app.get("/api/chain/quarantine/operations")
+    def quarantine_list():
+        return _json({"operations": node.blockchain.quarantine_operations()})
+
+    @app.post("/api/chain/quarantine/<op_id>/restore")
+    def quarantine_restore(op_id):
+        data = request.get_json(force=True, silent=True) or {}
+        if not data.get("confirm"):
+            return _json({"ok": False,
+                          "error": "需要确认：撤销隔离会把原始区块文件恢复到链目录"},
+                         400)
+        heights, residual, err = node.restore_quarantine(op_id)
+        if err:
+            return _json({"ok": False, "error": err}, 400)
+        return _json({"ok": True, "restored_heights": heights,
+                      "residual_damage": residual,
+                      "height": node.blockchain.height})
 
     @app.get("/api/chain/forks")
     def chain_forks():
@@ -570,7 +657,7 @@ def create_app(node):
     @app.post("/api/admin/reset")
     def admin_reset():
         import shutil
-        for sub in ("blocks", "state", "contracts"):
+        for sub in ("blocks", "state", "contracts", "quarantine"):
             shutil.rmtree(os.path.join(node.paths.root, sub), ignore_errors=True)
             os.makedirs(os.path.join(node.paths.root, sub), exist_ok=True)
         node.blockchain = _fresh_blockchain(node)
@@ -654,3 +741,15 @@ def _fresh_blockchain(node):
     bc = Blockchain(node.cfg, node.paths)
     bc.create_genesis()
     return bc
+
+
+def _operation_summary(op):
+    return {
+        "id": op["id"], "time": op["time"],
+        "truncate_height": op.get("truncate_height"),
+        "note": op.get("note", ""),
+        "blocks": [{"height": b["height"], "status": b["status"],
+                    "reason": b.get("reason", ""),
+                    "errors": b.get("errors", [])} for b in op["blocks"]],
+        "tx_readmitted": op.get("tx_readmitted"),
+    }
